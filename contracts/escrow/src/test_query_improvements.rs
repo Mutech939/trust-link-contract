@@ -4,9 +4,7 @@
 
 use crate::test_helpers::{create_funded_escrow, setup_contract};
 use crate::{Payee, ResolutionType};
-use soroban_sdk::{
-    testutils::Address as _, token, Address, BytesN, Env, IntoVal, String, Symbol, Vec,
-};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, Symbol, Vec};
 
 fn register_token(env: &Env) -> Address {
     let token_admin = Address::generate(env);
@@ -225,9 +223,9 @@ fn test_get_resolver_votes_with_fifty_votes() {
     client.raise_dispute(
         &buyer,
         &escrow_id,
-        &Symbol::new(&env, "item"),
-        &String::from_str(&env, "not received"),
-        &BytesN::from_array(&env, &[0; 32]),
+        &Symbol::new(&env, "ITEM_NOT_RECEIVED"),
+        &soroban_sdk::Bytes::from_slice(&env, b"not received"),
+        &BytesN::from_array(&env, &[1; 32]),
     );
 
     for resolver in resolvers.iter() {
@@ -267,7 +265,7 @@ fn test_get_escrows_by_ids_respects_cap() {
         created_ids.push_back(id);
     }
 
-    // Build query with 60 IDs (exceeds MAX_MESSAGES_PER_PAGE = 50)
+    // Build query with 60 IDs (exceeds MAX_IDS_PER_QUERY = 50)
     let mut ids = Vec::new(&env);
     for i in 0..10 {
         ids.push_back(created_ids.get(i).unwrap());
@@ -318,4 +316,89 @@ fn test_get_escrows_by_ids_under_cap() {
     for i in 0..5 {
         assert!(results.get(i).unwrap().is_some());
     }
+}
+
+// ── Basket token balance inspection ─────────────────────────────────────────
+
+#[test]
+fn test_get_basket_balances_before_and_after_funding() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_contract_id, client, _admin, _fee_collector) = setup_contract(&env);
+    let primary = register_token(&env);
+    let secondary = register_token(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let resolver = Address::generate(&env);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(primary.clone());
+    tokens.push_back(secondary.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+    amounts.push_back(500_i128);
+
+    let escrow_id = client.create_basket_escrow(
+        &seller,
+        &Some(buyer.clone()),
+        &resolver,
+        &tokens,
+        &amounts,
+        &0_u32,
+        &3600_u64,
+        &None::<soroban_sdk::String>,
+        &None::<u64>,
+        &0_u64,
+    );
+
+    let before = client.get_basket_balances(&escrow_id);
+    assert_eq!(before.len(), 2);
+    assert_eq!(before.get(0).unwrap().token, primary);
+    assert_eq!(before.get(0).unwrap().pledged_amount, 1_000);
+    assert_eq!(before.get(0).unwrap().contract_balance, 0);
+    assert_eq!(before.get(1).unwrap().token, secondary);
+    assert_eq!(before.get(1).unwrap().pledged_amount, 500);
+    assert_eq!(before.get(1).unwrap().contract_balance, 0);
+
+    mint_tokens(&env, &primary, &buyer, 1_000);
+    mint_tokens(&env, &secondary, &buyer, 500);
+    client.fund_basket_escrow(&escrow_id, &buyer);
+
+    let after = client.get_basket_balances(&escrow_id);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after.get(0).unwrap().pledged_amount, 1_000);
+    assert_eq!(after.get(0).unwrap().contract_balance, 1_000);
+    assert_eq!(after.get(1).unwrap().pledged_amount, 500);
+    assert_eq!(after.get(1).unwrap().contract_balance, 500);
+}
+
+#[test]
+fn test_get_basket_balances_missing_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _admin, _fee_collector) = setup_contract(&env);
+
+    assert_eq!(
+        client.try_get_basket_balances(&42_u64),
+        Err(Ok(crate::ContractError::EscrowNotFound))
+    );
+}
+
+#[test]
+fn test_get_basket_balances_empty_for_single_token_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token = register_token(&env);
+    let (_contract_id, client, _admin, _fee_collector) = setup_contract(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let resolver = Address::generate(&env);
+
+    let escrow_id = create_funded_escrow(
+        &env, &client, &seller, &buyer, &resolver, &token, 1_000, 100, 3600,
+    );
+
+    assert_eq!(client.get_basket_balances(&escrow_id).len(), 0);
 }

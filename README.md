@@ -70,7 +70,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete state machine with guard
 
 | Function | Auth | Description |
 |---|---|---|
-| `create_escrow(seller, resolver, token, amount, shipping_window)` | seller | Creates escrow, assigns sequential `u32` ID. Buyer unknown until funding. |
+| `create_escrow(seller_or_payees, buyer, resolver, token, amount, fee_bps, resolver_fee_bps, shipping_window, notes)` | seller/payees | Creates escrow with optional buyer and notes. |
 | `fund_escrow(escrow_id, buyer)` | buyer | Transfers `amount` tokens from buyer to contract, sets `funded_at`. |
 | `mark_shipped(escrow_id)` | seller | Sets state to `Shipped`, starts delivery clock at `shipped_at`. |
 | `confirm_delivery(escrow_id)` | buyer | Transfers tokens from contract to seller, state ? `Completed`. |
@@ -269,18 +269,34 @@ Admin can pause the contract and update fee parameters. Admin compromises primar
 
 The escrow lifecycle is a finite state machine. The escrow states are defined in `contracts/escrow/src/types.rs`:
 
+- `Pending` — the escrow exists but holds no funds yet; the seller may cancel it, and it becomes `Expired` if `reclaim_expired` runs after the expiry window.
+- `Funded` — the buyer deposited `amount`; the dispute window is open and the seller may `mark_shipped`.
+- `Shipped` — the seller recorded a tracking id; the delivery window is running toward auto-release.
+- `Completed` — funds were released to the payees (buyer confirmed delivery, `auto_release` fired, or a dispute was finalized for the seller).
+- `Disputed` — the buyer opened a dispute; funds are frozen pending a resolver decision.
+- `RefundRequested` — the buyer asked for a refund; the seller must approve it, which moves the escrow to `Refunded`.
+- `Refunded` — the amount was returned to the buyer.
+- `Canceled` — the escrow was canceled before funding; no money ever moved.
+- `PendingFinalization` — a resolution is recorded and the appeal window is running; `finalize_dispute` settles it.
+- `Expired` — a `Pending` escrow was reclaimed past its expiry without ever being funded.
+
+The transition graph for these ten states is shown in the [state machine diagram](#state-machine) above.
+
+### Build & Test
+
 - Rust 1.75+
 - [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) 21+
 - wasm32v1-none target (`rustup target add wasm32v1-none`)
-
-### Build & Test
 
 ```bash
 # Build for Soroban
 cargo build --target wasm32v1-none -p trustlink-escrow
 
-# Run all 16 tests
-cargo test -p trustlink-escrow
+# Run the unit tests (fast local loop)
+make test
+
+# Run every test target — unit tests + integration suites (what CI enforces)
+make test-all
 ```
 
 Unit tests run against the mock `Env`. For end-to-end coverage against a real
@@ -316,13 +332,6 @@ with longer runs on a nightly schedule. See
 make fuzz-build                   # compile all targets
 FUZZ_TIME=60 make fuzz            # run each target for 60s
 ```
-- `Pending`
-- `Funded`
-- `Shipped`
-- `Completed`
-- `Disputed`
-- `Refunded`
-- `Canceled`
 
 ### State transitions in practice
 
@@ -370,15 +379,19 @@ stellar contract deploy \
 ### Invoke Examples
 
 ```bash
-# Create escrow (buyer unknown yet)
+# Create escrow (buyer is optional in the contract; pass one to restrict funding)
 stellar contract invoke \
   --id $CONTRACT_ID --source seller --network testnet -- \
   create_escrow \
-  --seller $SELLER_ADDR \
+  --seller_or_payees $SELLER_ADDR \
+  --buyer $BUYER_ADDR \
   --resolver $RESOLVER_ADDR \
   --token $USDC_CONTRACT \
   --amount 50000000 \
-  --shipping_window 604800
+  --fee_bps 50 \
+  --resolver_fee_bps 50 \
+  --shipping_window 604800 \
+  --notes "optional note, max 500 chars"
 
 # Fund escrow (buyer connects wallet)
 stellar contract invoke \
@@ -401,12 +414,19 @@ stellar contract invoke \
 stellar contract invoke \
   --id $CONTRACT_ID --source seller --network testnet -- \
   create_escrow \
-  --seller $SELLER_ADDR \
+  --seller_or_payees $SELLER_ADDR \
+  --buyer $BUYER_ADDR \
   --resolver $RESOLVER_ADDR \
   --token $USDC_CONTRACT \
   --amount 50000000 \
-  --shipping_window 604800
+  --fee_bps 50 \
+  --resolver_fee_bps 50 \
+  --shipping_window 604800 \
+  --notes "optional note, max 500 chars"
 ```
+
+The full signature and the guards each argument is checked against are in
+[8.2 Escrow management](#82-escrow-management).
 
 #### Fund escrow
 ```bash
@@ -592,10 +612,17 @@ Each meaningful lifecycle step emits an event (examples):
 - `EscrowFunded`
 - `EscrowShipped`
 - `EscrowCompleted`
-- `EscrowCancelled`
+- `EscrowCanceled`
 - `DisputeRaised`
 - `DisputeResolved`
 - `AutoReleased`
+
+Payout event amounts are **pre-fee gross values**, not the net amounts transferred:
+
+- `EscrowCompleted.amount` is the gross escrowed amount before the protocol fee. Derive the net payout as `amount - floor(amount * fee_bps / 10_000)`.
+- `DisputeResolved.amount` is the escrow balance after arbitration/resolver fees and before the platform/protocol fees. The recipient payout is `amount - platform_fee - protocol_fee`, where the protocol fee is `floor((amount + arbitration_fee + resolver_fee) * fee_bps / 10_000)`.
+
+The indexer exposes `deriveNetAmount` and `deriveDisputeNetAmount` in `indexer/src/types.ts` for these derivations.
 
 The tests include numerous snapshot JSON files under `contracts/escrow/test_snapshots/?` that strongly suggests events are checked for stability and correctness.
 
@@ -659,6 +686,8 @@ The arbitration fee is handled as a separate deduction in `resolve_dispute`.
 ### 6.4 Multi-payee rounding dust
 
 When a payout is split across multiple payees, the contract calculates floor-rounded amounts for secondary payees and assigns the remaining net amount to the first payee. This preserves total payout conservation while making the rounding policy deterministic. The maximum bias is bounded by `N - 1` stroops for `N` payees because each secondary payee can contribute at most one truncated stroop of dust.
+
+**Dust-to-first-payee policy.** Payees `1..N` (every payee except `payees[0]`) receive `floor(net * bps / 10000)`; `payees[0]` receives `net` minus the sum of those floored amounts. Dust is therefore always credited to the first payee, never to the others, so for multi-payee splits the first payee is systematically favoured by strictly less than `N - 1` stroops (at most `N - 1`) per payout. For a single payee there is no dust. Order the payees list accordingly if this bias matters to you. No stroop is lost or created: the payouts always sum exactly to `net`.
 
 ---
 
@@ -744,15 +773,20 @@ A second call panics in current implementation.
 
 ### 8.2 Escrow management
 
-#### `create_escrow(seller, resolver, token, amount, fee_bps, shipping_window)`
+#### `create_escrow(seller_or_payees, buyer, resolver, token, amount, fee_bps, resolver_fee_bps, shipping_window, notes)`
 
-- **Auth:** `seller.require_auth()`.
-- **Guards:** amount > 0, fee_bps <= 300, not paused.
+The production entry point. The first argument is polymorphic: it accepts either
+a single seller `Address` or a `Vec<Payee>` (`{ address, bps }` shares summing
+to 10,000 bps) to split the payout across multiple payees.
+
+- **Auth:** the first payee's `require_auth()` — the seller in the single-address form.
+- **Guards:** not paused; `amount` within the admin-configured `[min_amount, max_amount]` bounds; `fee_bps` and `resolver_fee_bps` each <= 300; `shipping_window` in `[1, 63_072_000]` seconds; `notes` <= 500 characters; resolver distinct from every payee and from the buyer (`ConflictingRoles` otherwise); resolver present in the approved registry when strict mode is enabled (`UnauthorizedResolver` otherwise); `token` on the allowlist when the allowlist is enabled (`TokenNotAllowed` otherwise); at most 10 payees whose `bps` sum to exactly 10,000 (`PayeeBpsMismatch` otherwise).
 - **Effects:**
   - creates new escrow record with unique id from `EscrowCounter`,
   - resolver set configured as `ResolverSet::Single(resolver)`,
   - state = `Pending`,
-  - buyer is unset (`None`),
+  - `buyer` is stored as given: `None` leaves the escrow open for anyone to fund, while `Some(buyer)` restricts funding to that address (`fund_escrow` rejects any other caller with `NotAuthorizedBuyer`),
+  - `notes` is stored as the empty string when `None` is passed,
   - dispute deadline and funding fields set to zero defaults.
 
 #### `create_escrow_with_fallback(seller, buyer, primary_resolver, backup_resolver, dispute_deadline, token, amount, fee_bps, shipping_window)`
@@ -778,7 +812,7 @@ A second call panics in current implementation.
 
 - **Auth:** seller require auth (escrow.seller).
 - **Guards:** escrow must be in `Pending`.
-- **Effects:** state = `Canceled` and emits `EscrowCancelled`.
+- **Effects:** state = `Canceled` and emits `EscrowCanceled`.
 
 ### 8.3 Delivery & dispute flows
 
@@ -859,27 +893,23 @@ Whether clients use this function depends on the deployment; the contract also p
 
 ## 9. Error codes
 
-The contract uses Soroban typed errors defined in `contracts/escrow/src/types.rs`:
+The contract uses Soroban typed errors, defined as the `ContractError` enum in
+`contracts/escrow/src/errors.rs`. The numeric values are stable ABI — they are
+part of the deployed contract interface and must never be renumbered.
 
-- `InvalidAmount = 1`
-- `InsufficientBalance = 2`
-- `EscrowNotFound = 3`
-- `InvalidState = 4`
-- `NotAuthorized = 5`
-- `AlreadyInitialized = 6`
-- `FeeExceedsMax = 7`
-- `EscrowHasNoBuyer = 8`
-- `ShippingWindowNotElapsed = 9`
-- `InvalidEvidenceHash = 10`
-- `DisputeNotFound = 11`
-- `ArithmeticError = 12`
-- `DisputeWindowClosed = 13`
-- `ContractPaused = 14`
-- `ArithmeticOverflow = 15`
-- `InvalidStateTransition = 16`
-- `InputTooLong = 17`
+**The canonical reference is [`ERROR_CODES.md`](ERROR_CODES.md).** That file
+lists every error code with its numeric value, the exact condition that
+triggers it, and the remediation for it. It is the single source of truth for
+error handling — read it rather than relying on a partial list here.
 
-Client applications should handle these errors by showing user-friendly messages or by retrying/correcting inputs depending on the code.
+The TypeScript bindings mirror the same enum in
+[`bindings/src/errors.ts`](bindings/src/errors.ts); `scripts/check-error-codes.mjs`
+enforces that the two stay in sync in CI, and
+[`bindings/src/errors.ts`](bindings/src/errors.ts) additionally maps codes to
+typed exceptions for client applications.
+
+Client applications should handle these errors by showing user-friendly messages
+or by retrying/correcting inputs depending on the code.
 
 ---
 
@@ -1011,9 +1041,9 @@ Contribution guidelines are in `CONTRIBUTING.md`.
 
 Recommended workflow:
 
-- format with `cargo fmt`,
-- lint with `cargo clippy -- -D warnings`,
-- run tests with `cargo test`,
+- format with `make fmt` (check with `make fmt-check`),
+- lint with `make clippy` (the canonical gate — identical to the pre-commit hook and CI),
+- run tests with `make test-all` (unit + integration suites),
 - ensure CI passes before opening a PR.
 
 The repository participates in the **Stellar Wave Program**, and the docs describe issue labels and contribution points.

@@ -72,6 +72,23 @@ export const enum ErrorCode {
   NotAuthorizedSeller = 62,
   EscrowAlreadyCompleted = 63,
   EscrowAlreadyRefunded = 64,
+  AppealFeeExceedsMax = 65,
+  AppealFeeBelowMinimum = 66,
+  NotInRecoveryMode = 67,
+  InvalidDisputeReason = 68,
+  InvalidOperation = 69,
+  InvalidTimelockDelay = 70,
+  InvalidProposalHash = 71,
+  DuplicateNotes = 72,
+  GracePeriodTooLong = 73,
+  TimestampInvariantViolated = 74,
+  NoPendingFeeCollector = 75,
+  InvalidMaxAppeals = 76,
+  InvalidMaxBasketSize = 77,
+  InvalidWasmHash = 78,
+  NoPendingTreasury = 79,
+  DuplicateResolver = 80,
+  EvidenceLimitReached = 81,
 }
 
 /** Human-readable message for every contract error code. */
@@ -188,6 +205,40 @@ export const ERROR_MESSAGES: Readonly<Record<ErrorCode, string>> = {
     "The escrow has already been completed.",
   [ErrorCode.EscrowAlreadyRefunded]:
     "The escrow has already been refunded.",
+  [ErrorCode.AppealFeeExceedsMax]:
+    "The appeal fee exceeds its configured maximum.",
+  [ErrorCode.AppealFeeBelowMinimum]:
+    "The appeal fee is below the allowed minimum.",
+  [ErrorCode.NotInRecoveryMode]:
+    "The contract is not in recovery mode.",
+  [ErrorCode.InvalidDisputeReason]:
+    "The dispute reason is not in the allowed set.",
+  [ErrorCode.InvalidOperation]:
+    "The operation ID does not map to a valid timelock operation.",
+  [ErrorCode.InvalidTimelockDelay]:
+    "The timelock delay is outside allowed bounds.",
+  [ErrorCode.InvalidProposalHash]:
+    "The executed parameters do not match the queued proposal hash.",
+  [ErrorCode.DuplicateNotes]:
+    "A batch_create_escrow call contains duplicate notes values.",
+  [ErrorCode.GracePeriodTooLong]:
+    "The grace period exceeds the maximum allowed grace period.",
+  [ErrorCode.TimestampInvariantViolated]:
+    "Resolution timestamp cannot be earlier than dispute timestamp.",
+  [ErrorCode.NoPendingFeeCollector]:
+    "No pending fee collector is set for accept_fee_collector.",
+  [ErrorCode.InvalidMaxAppeals]:
+    "The max appeals value is outside the supported range.",
+  [ErrorCode.InvalidMaxBasketSize]:
+    "The max basket size value is outside the supported range.",
+  [ErrorCode.InvalidWasmHash]:
+    "The WASM hash is all-zero or otherwise invalid for upgrade.",
+  [ErrorCode.NoPendingTreasury]:
+    "No pending treasury is set for accept_treasury.",
+  [ErrorCode.DuplicateResolver]:
+    "The same address appears more than once in the resolver configuration.",
+  [ErrorCode.EvidenceLimitReached]:
+    "The escrow's dispute evidence log has reached its maximum number of entries.",
 };
 
 /**

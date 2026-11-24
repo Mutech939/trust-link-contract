@@ -203,8 +203,11 @@ export interface EscrowInput {
 export interface ContractStats {
   total_created: bigint;
   total_completed: bigint;
+  /** Unique escrows ever disputed (appeals do not inflate this). */
   total_disputed: bigint;
   total_refunded: bigint;
+  /** Total appeal cycles across all escrows. */
+  total_appeals: bigint;
 }
 
 /** Public, read-only contract configuration from `get_public_config`. */
@@ -333,7 +336,12 @@ export interface EscrowCompleted {
   schema_version: number;
   escrow_id: bigint;
   recipient: AddressLike;
+  /**
+   * Gross escrowed amount before the protocol fee — not the amount paid to
+   * `recipient`. The net payout is `amount - floor(amount * fee_bps / 10_000)`.
+   */
   amount: bigint;
+  /** Protocol fee rate in basis points that was applied to `amount`. */
   fee_bps: number;
   timestamp: bigint;
   prev_state: EscrowState;
@@ -372,9 +380,15 @@ export interface DisputeResolved {
   resolver: AddressLike;
   resolution: ResolutionType;
   recipient: AddressLike;
+  /**
+   * Escrow balance after arbitration/resolver fees and before platform and
+   * protocol fees — not the amount paid to `recipient`. The net payout is
+   * `amount - platform_fee - protocol_fee`.
+   */
   amount: bigint;
   arbitration_fee: bigint;
   resolver_fee: bigint;
+  platform_fee: bigint;
   timestamp: bigint;
   prev_state: EscrowState;
   new_state: EscrowState;

@@ -6,7 +6,7 @@
 //! - 501 bps rejected with `ProtocolFeeExceedsMax` (MAX_PROTOCOL_FEE_BPS = 500)
 //! - non-admin caller rejected with `NotAuthorized`
 
-use crate::{ContractError, Escrow, EscrowClient, FeeConfig};
+use crate::{ContractError, Escrow, EscrowClient};
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
 fn deploy(env: &Env) -> (EscrowClient<'static>, Address, Address) {
@@ -20,14 +20,7 @@ fn deploy(env: &Env) -> (EscrowClient<'static>, Address, Address) {
 
 fn stored_fee(env: &Env, contract_id: &Address) -> u32 {
     env.as_contract(contract_id, || {
-        env.storage()
-            .instance()
-            .get::<_, FeeConfig>(&crate::DataKey::FeeConfig)
-            .unwrap_or(FeeConfig {
-                protocol_fee_bps: 0,
-                arbitration_fee_bps: 0,
-            })
-            .protocol_fee_bps
+        crate::storage::read_fee_config(env).protocol_fee_bps
     })
 }
 

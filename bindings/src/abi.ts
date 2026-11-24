@@ -147,15 +147,27 @@ export const contractAbi = {
       ],
       output: "u64",
     },
-    {
+       {
       name: "create_basket_escrow",
-      inputs: ["seller", "buyer", "resolver", "tokens", "amounts", "fee_bps", "shipping_window"],
+      inputs: [
+        "seller",
+        "buyer",
+        "resolver",
+        "tokens",
+        "amounts",
+        "fee_bps",
+        "shipping_window",
+        "notes",
+        "expires_at",
+        "grace_period",
+      ],
       output: "u64",
     },
     { name: "batch_create_escrow", inputs: ["seller", "escrows"], output: "Vec<u64>" },
 
     // -----------------------------------------------------------------------
     // Escrow lifecycle
+
     // -----------------------------------------------------------------------
     { name: "fund_escrow", inputs: ["escrow_id", "buyer"], output: "void" },
     { name: "fund_basket_escrow", inputs: ["escrow_id", "buyer"], output: "void" },
@@ -222,8 +234,8 @@ export const contractAbi = {
     { name: "get_dispute", inputs: ["escrow_id"], output: "Option<DisputeData>" },
     { name: "get_state_history", inputs: ["escrow_id"], output: "Vec<[EscrowState, u64]>" },
     { name: "get_escrows_by_buyer", inputs: ["buyer"], output: "Vec<u64>" },
-    { name: "get_escrows_by_seller", inputs: ["seller"], output: "Vec<u64>" },
-    { name: "get_escrows_by_vendor", inputs: ["vendor"], output: "Vec<u64>" },
+    { name: "get_escrows_by_seller", inputs: ["seller", "start", "limit"], output: "Vec<u64>" },
+    { name: "get_escrows_by_vendor", inputs: ["vendor", "start", "limit"], output: "Vec<u64>" },
     { name: "get_escrows_by_ids", inputs: ["ids"], output: "Vec<Option<EscrowData>>" },
     { name: "get_basket_tokens", inputs: ["escrow_id"], output: "Vec<TokenEntry>" },
     { name: "get_stats", inputs: [], output: "ContractStats" },

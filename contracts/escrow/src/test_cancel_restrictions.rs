@@ -123,8 +123,8 @@ fn cancel_fails_in_completed_state() {
                 .get(&DataKey::Escrow(fx.escrow_id))
         })
         .expect("escrow exists");
-    fx.env.ledger().set_timestamp(escrow.dispute_deadline + 1);
-    fx.client.confirm_delivery(&fx.buyer, &fx.escrow_id);
+    fx.env.ledger().set_timestamp(escrow.dispute_deadline() + 1);
+    fx.client.confirm_delivery(&fx.buyer, &fx.escrow_id, &false);
 
     // Cancelling a Completed escrow now gets the dedicated code (was InvalidState).
     assert_eq!(
@@ -139,8 +139,8 @@ fn cancel_fails_in_disputed_state() {
     fx.client.fund_escrow(&fx.escrow_id, &fx.buyer);
     ship(&fx);
 
-    let reason = Symbol::new(&fx.env, "non_delivery");
-    let description = String::from_str(&fx.env, "missing");
+    let reason = Symbol::new(&fx.env, "ITEM_NOT_RECEIVED");
+    let description = soroban_sdk::Bytes::from_slice(&fx.env, b"missing");
     let evidence = BytesN::from_array(&fx.env, &[0xab; 32]);
     fx.client
         .raise_dispute(&fx.buyer, &fx.escrow_id, &reason, &description, &evidence);
@@ -160,8 +160,8 @@ fn cancel_fails_in_refunded_state() {
     fx.client.fund_escrow(&fx.escrow_id, &fx.buyer);
     ship(&fx);
 
-    let reason = Symbol::new(&fx.env, "non_delivery");
-    let description = String::from_str(&fx.env, "missing");
+    let reason = Symbol::new(&fx.env, "ITEM_NOT_RECEIVED");
+    let description = soroban_sdk::Bytes::from_slice(&fx.env, b"missing");
     let evidence = BytesN::from_array(&fx.env, &[0xab; 32]);
     fx.client
         .raise_dispute(&fx.buyer, &fx.escrow_id, &reason, &description, &evidence);
@@ -221,8 +221,8 @@ fn buyer_cancel_fails_in_completed_state() {
                 .get(&DataKey::Escrow(fx.escrow_id))
         })
         .expect("escrow exists");
-    fx.env.ledger().set_timestamp(escrow.dispute_deadline + 1);
-    fx.client.confirm_delivery(&fx.buyer, &fx.escrow_id);
+    fx.env.ledger().set_timestamp(escrow.dispute_deadline() + 1);
+    fx.client.confirm_delivery(&fx.buyer, &fx.escrow_id, &false);
 
     // Cancelling a Completed escrow now gets the dedicated code (was InvalidState).
     assert_eq!(
@@ -237,8 +237,8 @@ fn buyer_cancel_fails_in_disputed_state() {
     fx.client.fund_escrow(&fx.escrow_id, &fx.buyer);
     ship(&fx);
 
-    let reason = Symbol::new(&fx.env, "non_delivery");
-    let description = String::from_str(&fx.env, "missing");
+    let reason = Symbol::new(&fx.env, "ITEM_NOT_RECEIVED");
+    let description = soroban_sdk::Bytes::from_slice(&fx.env, b"missing");
     let evidence = BytesN::from_array(&fx.env, &[0xab; 32]);
     fx.client
         .raise_dispute(&fx.buyer, &fx.escrow_id, &reason, &description, &evidence);
@@ -255,8 +255,8 @@ fn buyer_cancel_fails_in_refunded_state() {
     fx.client.fund_escrow(&fx.escrow_id, &fx.buyer);
     ship(&fx);
 
-    let reason = Symbol::new(&fx.env, "non_delivery");
-    let description = String::from_str(&fx.env, "missing");
+    let reason = Symbol::new(&fx.env, "ITEM_NOT_RECEIVED");
+    let description = soroban_sdk::Bytes::from_slice(&fx.env, b"missing");
     let evidence = BytesN::from_array(&fx.env, &[0xab; 32]);
     fx.client
         .raise_dispute(&fx.buyer, &fx.escrow_id, &reason, &description, &evidence);

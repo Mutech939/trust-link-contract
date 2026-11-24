@@ -15,7 +15,7 @@ use crate::test_helpers::{create_funded_escrow, setup_contract};
 use crate::types::Message;
 use crate::{
     ContractCall, ContractError, DataKey, EscrowClient, Payee, ESCROW_INDEX_PAGE_SIZE,
-    MAX_BASKET_SIZE, MAX_MULTICALL_BATCH_SIZE,
+    MAX_BASKET_SIZE, MAX_ESCROWS_PER_PAGE, MAX_MULTICALL_BATCH_SIZE,
 };
 use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, String, Symbol, Vec};
 
@@ -281,6 +281,9 @@ fn basket_above_the_lowered_limit_is_rejected() {
             &amounts,
             &0_u32,
             &3_600_u64,
+            &None::<String>,
+            &None::<u64>,
+            &0_u64,
         ),
         Err(Ok(ContractError::BasketTokenMismatch)),
     );
@@ -305,7 +308,7 @@ fn vendor_index_is_sharded_and_reads_back_in_order() {
         ));
     }
 
-    let got = client.get_escrows_by_vendor(&vendor);
+    let got = client.get_escrows_by_vendor(&vendor, &0_u64, &50_u64);
     assert_eq!(got.len(), total);
     for i in 0..total {
         assert_eq!(got.get(i).unwrap(), expected.get(i).unwrap());
@@ -399,7 +402,7 @@ fn legacy_vendor_index_is_migrated_on_next_write() {
 
     let new_id = create_escrow(&env, &client, &vendor, &resolver, &token, 1_000);
 
-    let got = client.get_escrows_by_vendor(&vendor);
+    let got = client.get_escrows_by_vendor(&vendor, &0_u64, &50_u64);
     assert_eq!(got.len(), 3);
     assert_eq!(got.get(0).unwrap(), 100);
     assert_eq!(got.get(1).unwrap(), 200);
@@ -409,4 +412,71 @@ fn legacy_vendor_index_is_migrated_on_next_write() {
         &contract_id,
         &DataKey::VendorEscrowIndex(vendor.clone())
     ));
+}
+
+#[test]
+fn vendor_and_seller_views_paginate_over_more_than_sixty_escrows() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_contract_id, client, _admin, _fee_collector) = setup_contract(&env);
+    let vendor = Address::generate(&env);
+    let resolver = Address::generate(&env);
+    let token = register_token(&env);
+
+    let total: u32 = 65;
+    let mut expected = Vec::new(&env);
+    for _ in 0..total {
+        expected.push_back(create_escrow(
+            &env, &client, &vendor, &resolver, &token, 1_000,
+        ));
+    }
+
+    // First window is capped at MAX_ESCROWS_PER_PAGE even when more is asked for.
+    let first = client.get_escrows_by_vendor(&vendor, &0_u64, &1_000_u64);
+    assert_eq!(u64::from(first.len()), MAX_ESCROWS_PER_PAGE);
+    for i in 0..first.len() {
+        assert_eq!(first.get(i).unwrap(), expected.get(i).unwrap());
+    }
+
+    // Second window holds the remainder, still ascending.
+    let second = client.get_escrows_by_vendor(&vendor, &50_u64, &50_u64);
+    assert_eq!(second.len(), total - 50);
+    for i in 0..second.len() {
+        assert_eq!(second.get(i).unwrap(), expected.get(50 + i).unwrap());
+    }
+
+    // A window that straddles index-page boundaries (page size is 20).
+    let mid = client.get_escrows_by_vendor(&vendor, &15_u64, &10_u64);
+    assert_eq!(mid.len(), 10);
+    for i in 0..mid.len() {
+        assert_eq!(mid.get(i).unwrap(), expected.get(15 + i).unwrap());
+    }
+
+    // Partial last window and out-of-range / zero-limit requests.
+    let tail = client.get_escrows_by_vendor(&vendor, &60_u64, &10_u64);
+    assert_eq!(tail.len(), 5);
+    assert_eq!(tail.get(4).unwrap(), expected.get(64).unwrap());
+    assert_eq!(
+        client
+            .get_escrows_by_vendor(&vendor, &65_u64, &10_u64)
+            .len(),
+        0
+    );
+    assert_eq!(
+        client.get_escrows_by_vendor(&vendor, &0_u64, &0_u64).len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_escrows_by_vendor(&vendor, &u64::MAX, &u64::MAX)
+            .len(),
+        0
+    );
+
+    // The seller view is the same index with the same windows.
+    assert_eq!(
+        client.get_escrows_by_seller(&vendor, &50_u64, &50_u64),
+        second
+    );
+    assert_eq!(client.get_escrows_by_seller(&vendor, &15_u64, &10_u64), mid);
 }

@@ -10,7 +10,9 @@ the create-escrow flow end to end and links out to it for everything else.
 - [Installation](#installation)
 - [Creating a transport](#creating-a-transport)
 - [Creating an escrow](#creating-an-escrow)
+- [Reading basket tokens](#reading-basket-tokens)
 - [Funding and progressing an escrow](#funding-and-progressing-an-escrow)
+- [Reading message pages](#reading-message-pages)
 - [Listening for events](#listening-for-events)
 - [Error handling](#error-handling)
 - [Testing on testnet](#testing-on-testnet)
@@ -79,6 +81,7 @@ const escrowId = await client.create_escrow(
   250,               // fee_bps — protocol fee, in basis points
   50,                // resolver_fee_bps
   86_400n,           // shipping_window, in seconds
+  null,              // notes (or an empty string)
 );
 
 // Split payout across two sellers
@@ -94,13 +97,80 @@ const splitEscrowId = await client.create_escrow(
   250,
   50,
   86_400n,
+  null,              // notes
 );
 ```
+
+`notes` is the ninth argument and is required by the contract; pass `null` (or
+omit it — the client defaults to `null`) when you have nothing to record. The
+stored note is capped at 500 characters; a longer value is rejected with
+`InputTooLong`.
+
+The escrow's `buyer` is optional in the same way: `null` leaves the escrow open
+so that anyone may fund it, while passing an address restricts funding to that
+address — `fund_escrow` from anyone else fails with `NotAuthorizedBuyer`.
 
 For a resolver committee or a primary/backup resolver instead of a single
 resolver, use `create_escrow_multi` or `create_escrow_with_fallback` — see the
 `EscrowClient` method table in
 [bindings/README.md](../bindings/README.md#api-reference).
+
+## Reading basket tokens
+
+`get_basket_tokens(escrow_id)` returns `Option<Vec<TokenEntry>>`. The two outcomes
+carry distinct meanings and must not be collapsed into one "empty" case:
+
+| Return value | Meaning | What a caller/indexer should do |
+|---|---|---|
+| `None` | The escrow id does not exist (`EscrowNotFound` internally) | Treat as unknown id; do not create a basket row |
+| `Some([])` (empty `Vec`) | The escrow exists and is a **single-token** escrow (created with `create_escrow*`) | Not a basket — record `token_count = 0`, or skip the basket table |
+| `Some([TokenEntry, …])` | The escrow exists and is a **basket** escrow (`create_basket_escrow`), with `len()` entries | Record `token_count = len()` |
+
+```ts
+const tokens = await client.get_basket_tokens(escrowId);
+if (tokens === null) {
+  // Escrow does not exist — nothing to index.
+} else if (tokens.length === 0) {
+  // Existing, single-token escrow: not a basket.
+} else {
+  // Basket: `tokens` holds every { token, amount } pair, primary first.
+}
+```
+
+`Some([])` is not an error and does not mean "missing": the escrow exists and
+its primary token/amount live on the `EscrowData` record, not in the basket
+list. Consumers that persist a `token_count` (e.g. the indexer's
+`basket_escrows` table) must only write a row for the `Some([…])` case, using
+`len()` as `token_count`.
+
+### Basket size limit
+
+`create_basket_escrow` accepts at most `get_max_basket_size()` tokens. The
+default is `MAX_BASKET_SIZE`; governance can queue and execute a timelocked
+lower value (down to 1) without an upgrade. Baskets with an empty token list or
+more entries than the configured limit are rejected with
+`BasketTokenMismatch`, so clients should read `get_max_basket_size()` rather
+than hard-code 20.
+
+### Reading basket balances
+
+`get_basket_balances(escrow_id)` returns `Vec<TokenBalanceInfo>` — one entry per
+stored basket token, each carrying `token`, `pledged_amount` (recorded at
+creation) and `contract_balance` (the contract's current SEP-41 balance for that
+token). Use it to tell whether a basket is unfunded (`contract_balance` is 0),
+funded, or already paid out:
+
+```ts
+const balances = await client.get_basket_balances(escrowId);
+for (const b of balances) {
+  console.log(b.token, b.pledged_amount, b.contract_balance);
+}
+```
+
+A missing escrow reverts with `EscrowNotFound` (unlike `get_basket_tokens`,
+which returns `None`). Single-token escrows return an empty `Vec`. Secondary
+basket tokens are split pro-rata across the escrow's payees on release; refund
+paths return them to the buyer in full.
 
 ## Funding and progressing an escrow
 
@@ -114,6 +184,33 @@ await client.confirm_delivery(buyerAddress, escrowId);
 const escrow = await client.get_escrow(escrowId);
 console.log(escrow.state); // e.g. "Completed"
 ```
+
+## Reading message pages
+
+`get_messages(escrowId, start, limit)` uses a zero-based `start` offset and
+returns messages in insertion order. The contract silently clamps any limit
+above `MAX_MESSAGES_PER_PAGE` (currently 50), so `limit = 1000` still returns
+at most 50 messages per page. Advance `start` by the number of messages that
+was actually returned:
+
+```ts
+const messages = [];
+let start = 0n;
+
+while (true) {
+  // A request for 1000 is safe, but the contract returns at most 50 here.
+  const page = await client.get_messages(escrowId, start, 1000n);
+  messages.push(...page);
+
+  if (page.length < 50) {
+    break; // The final page was shorter than the contract maximum.
+  }
+  start += BigInt(page.length);
+}
+```
+
+Use the returned page length rather than adding the requested `limit`: a
+request for 1000 does not create a 1000-message page.
 
 The full lifecycle (dispute raising/resolution, refunds, cancellation,
 auto-release, message threads) is documented method-by-method in

@@ -1,5 +1,9 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 use crate::internal::{
     add_or_update_vote, ensure_action_not_paused, execute_resolution_transition, get_ttl_extension,
     load_escrow, save_resolver_votes, tally_votes, terminal_state_error,
@@ -13,40 +17,19 @@ pub mod storage;
 pub mod types;
 
 mod admin;
+mod dispute_state_machine;
 mod disputes;
+pub use crate::disputes::DISPUTE_REASONS;
 mod instructions;
 mod internal;
 mod queries;
 pub use crate::errors::ContractError;
-pub use crate::events::{
-    emit_action_paused, emit_action_unpaused, emit_admin_rotated, emit_allowlist_toggled,
-    emit_amount_limits_updated, emit_appeal_fee_updated, emit_arbitration_fee_updated,
-    emit_auto_released, emit_basket_escrow_created, emit_contract_initialized,
-    emit_contract_paused, emit_contract_unpaused, emit_contract_upgraded,
-    emit_delivery_proposal_cancelled, emit_delivery_proposed, emit_delivery_recorded,
-    emit_dispute_appealed, emit_dispute_pending_finalization, emit_dispute_raised,
-    emit_dispute_resolved, emit_emergency_drain, emit_escrow_auto_canceled, emit_escrow_canceled,
-    emit_escrow_completed, emit_escrow_created, emit_escrow_expired, emit_escrow_funded,
-    emit_escrow_shipped, emit_fee_collector_updated, emit_fee_updated,
-    emit_pending_expiry_cleared, emit_platform_fee_updated, emit_protocol_fee_updated,
-    emit_recovery_mode_updated, emit_recovery_withdraw, emit_refund_approved,
-    emit_refund_requested, emit_resolver_approved, emit_resolver_removed, emit_resolver_rotated,
-    emit_resolver_strict_updated, emit_storage_migrated, emit_timelock_cancelled,
-    emit_timelock_executed, emit_timelock_queued, emit_token_allowlist_updated,
-    emit_treasury_updated, emit_ttl_extension_updated,
-    ActionPausedEvent, ActionUnpausedEvent, AdminRotated, AmountLimitsUpdated,
-    ArbitrationFeeUpdated, AutoReleased, ContractInitialized, ContractPausedEvent,
-    ContractUnpausedEvent, ContractUpgradedEvent, DeliveryProposalCancelled, DeliveryProposed,
-    DeliveryRecorded, DisputeRaised, DisputeResolved, EscrowAutoCanceled, EscrowCanceled,
-    EscrowCompleted, EscrowCreated, EscrowExpired, EscrowFunded, EscrowShipped, FeeUpdated,
-    PendingExpiryClear, ProtocolFeeUpdated, ResolverApproved, ResolverRemoved, ResolverRotated,
-    ResolverStrictUpdated, ResolverVoteRecorded, TimelockCancelled, TimelockExecuted,
-    TimelockQueued, TtlExtensionUpdated,
-};
+pub use crate::events::*;
 pub use crate::types::{
-    ContractConfig, ContractStats, DataKey, DisputeData, DisputeStatus, EscrowData, EscrowInput,
-    EscrowState, ExpirySchedule, FeeConfig, Payee, PublicContractConfig, ResolutionType,
-    ResolverSet, ResolverVote, TimelockOperation, TimelockProposal, TokenEntry,
+    ContractConfig, ContractStats, DataKey, DisputeData, DisputeStatus, Escrow as EscrowData,
+    EscrowInput, EscrowState, ExpirySchedule, FeeConfig, GlobalConfig, Payee, PublicContractConfig,
+    ResolutionType, ResolverSet, ResolverVote, TimelockOperation, TimelockProposal,
+    TokenBalanceInfo, TokenEntry,
 };
 
 /// A single call descriptor used by the `multicall` batching function.
@@ -74,14 +57,17 @@ const MAX_ARBITRATION_FEE_BPS: u32 = 500;
 /// Maximum protocol fee in basis points (500 = 5%).
 ///
 /// `set_fee` and `set_protocol_fee` reject any value above this with
-/// `FeeExceedsMax`, and it feeds the combined fee cap together with the
-/// arbitration fee.
+/// `ProtocolFeeExceedsMax`, and also enforce the combined cap
+/// (`MAX_COMBINED_FEE_BPS`) together with the arbitration fee.
+///
+/// This constant and both setters are cfg-gated to `test` / `testutils`
+/// builds and never ship in the production contract.
 #[cfg(any(test, feature = "testutils"))]
 const MAX_PROTOCOL_FEE_BPS: u32 = 500;
 
 /// Maximum combined protocol + arbitration fee in basis points (1000 = 10%).
 ///
-/// Ensures that protocol_fee_bps + arbitration_fee_bps cannot exceed 10%,
+/// Ensures that `protocol_fee_bps` + `arbitration_fee_bps` cannot exceed 10%,
 /// preventing the malicious admin attack where combined fees drain entire escrows.
 const MAX_COMBINED_FEE_BPS: u32 = 1_000;
 
@@ -93,7 +79,7 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// Bump this whenever the layout of a stored type changes, and extend
 /// [`Escrow::migrate`] with the corresponding step. Contracts deployed before
 /// versioning existed report `0`; see `docs/UPGRADES.md`.
-pub const STORAGE_VERSION: u32 = 1;
+pub const STORAGE_VERSION: u32 = 2;
 
 /// Maximum platform fee in basis points (200 = 2%).
 ///
@@ -127,11 +113,17 @@ const MIN_APPEAL_FEE_BPS: u32 = 10;
 /// opts in.
 const DEFAULT_APPEAL_FEE_BPS: u32 = 0;
 
-/// Minimum escrow amount in stroops.
-/// Keeps the contract from accepting zero or negative escrows.
+/// Default minimum escrow amount in stroops.
+///
+/// This is only the **default**: the canonical bound enforced by
+/// `create_escrow` and `create_basket_escrow` is `GlobalConfig::min_amount`,
+/// which is seeded from this constant by `storage::default_global_config` and
+/// can be changed by the admin through `set_amount_limits`. Validation always
+/// reads the stored config, so this constant alone does not describe what an
+/// initialized contract accepts.
 pub const MIN_ESCROW_AMOUNT: i128 = 1;
 
-/// Length of the dispute window in seconds (172_800 = 48 hours).
+/// Length of the dispute window in seconds (`172_800` = 48 hours).
 ///
 /// On `fund_escrow` the contract sets `dispute_deadline = funded_at +
 /// DISPUTE_WINDOW`. Until that deadline the buyer may `raise_dispute`, and
@@ -140,6 +132,11 @@ pub const MIN_ESCROW_AMOUNT: i128 = 1;
 const DISPUTE_WINDOW: u64 = 172_800;
 const DELIVERY_RELEASE_WINDOW: u64 = 172_800;
 pub const MIN_TTL_EXTENSION: u32 = 1_000;
+/// Maximum allowed TTL extension in ledgers.
+///
+/// Keeping this bounded prevents admin misconfiguration from setting an
+/// excessive duration that inflates rent fees across many persistent entries.
+pub const MAX_TTL_EXTENSION: u32 = 2_592_000; // ~30 days at 10s/ledger
 const DEFAULT_TTL_EXTENSION: u32 = 120_960;
 /// Divisor used when computing the threshold for TTL extension.
 /// TTL is extended to `ext / TTL_THRESHOLD_DIVISOR` on the low end,
@@ -150,8 +147,14 @@ const TTL_THRESHOLD_DIVISOR: u32 = 2;
 const PENDING_EXPIRY_WINDOW: u64 = 604_800;
 
 /// Longest a fallback escrow's primary resolver may hold sole authority over
-/// a dispute before the backup must be allowed to act (2_592_000 = 30 days).
+/// a dispute before the backup must be allowed to act (`2_592_000` = 30 days).
 const FALLBACK_PRIMARY_GRACE: u64 = 2_592_000;
+
+/// Shortest window (in seconds) a fallback escrow's primary resolver is
+/// guaranteed exclusive authority over a dispute (`86_400` = 1 day).
+/// `FallbackResolver::dispute_deadline` must be at least this far past the
+/// creation timestamp (`dispute_deadline >= now + MIN_FALLBACK_DEADLINE_OFFSET`).
+const MIN_FALLBACK_DEADLINE_OFFSET: u64 = 86_400;
 
 /// Furthest past the creation timestamp a `FallbackResolver::dispute_deadline`
 /// may be set. A dispute can be raised no later than `PENDING_EXPIRY_WINDOW +
@@ -164,12 +167,15 @@ const MAX_FALLBACK_DEADLINE_OFFSET: u64 =
 /// Maximum number of entries kept in an escrow's state history.
 /// Once reached, the oldest entry is dropped for each new one appended,
 /// bounding storage size for high-churn escrows (e.g. disputed <->
-/// pending_finalization cycles).
+/// `pending_finalization` cycles).
 const MAX_STATE_HISTORY_ENTRIES: u32 = 50;
 
-/// Basis points denominator (100% = 10_000 basis points).
+/// Basis points denominator (100% = `10_000` basis points).
 pub const BASIS_POINTS: u32 = 10_000;
 pub const DELIVERY_TIMELOCK: u64 = 86_400;
+
+/// Maximum grace period in seconds (7 days = 604,800 seconds).
+pub const MAX_GRACE_PERIOD: u64 = 604_800;
 
 /// Maximum length for user-supplied string fields.
 /// - `tracking_id`: 64 characters
@@ -180,6 +186,12 @@ pub const MAX_DESCRIPTION_LEN: u32 = 256;
 pub const MAX_NOTES_LEN: u32 = 500;
 pub const MAX_MESSAGE_LEN: u32 = 500;
 pub const MAX_MESSAGES_PER_ESCROW: u32 = 100;
+
+/// Maximum number of additional evidence entries that may be appended to an
+/// escrow's `EvidenceLog` via `submit_dispute_evidence`. Bounds the size of the
+/// single storage entry; the buyer's initial `raise_dispute` evidence is stored
+/// separately on `DisputeData` and does not count toward this cap.
+pub const MAX_EVIDENCE_ENTRIES: u32 = 5;
 
 /// Maximum number of tokens allowed in a basket escrow. Bounds iteration cost
 /// in `save_basket_tokens` and `payout_basket_tokens`, and keeps the basket
@@ -215,7 +227,7 @@ pub const ESCROW_INDEX_PAGE_SIZE: u32 = 20;
 pub const MIN_SHIPPING_WINDOW: u64 = 1;
 
 /// Maximum shipping window in seconds (approximately 2 years).
-/// Prevents accidental or malicious use of u64::MAX which would lock funds indefinitely.
+/// Prevents accidental or malicious use of `u64::MAX` which would lock funds indefinitely.
 pub const MAX_SHIPPING_WINDOW: u64 = 63_072_000;
 
 /// Default shipping window in seconds (3600 = 1 hour), used as a fallback by
@@ -226,16 +238,67 @@ pub const DEFAULT_SHIPPING_WINDOW: u64 = 3600;
 /// of the caller-supplied `limit`.
 pub const MAX_MESSAGES_PER_PAGE: u64 = 50;
 
-/// Maximum escrow amount intentionally capped to
-/// preserve arithmetic safety for fee calculations
-/// and aggregate accounting operations.
+/// Maximum number of ids `get_escrows_by_ids` will look up in one call.
+///
+/// Independent of [`MAX_MESSAGES_PER_PAGE`]: id-batch size and message paging
+/// are unrelated concerns and can be tuned separately. Extra ids beyond the cap
+/// are silently **truncated** (the call never errors), so callers must send at
+/// most this many ids per request.
+pub const MAX_IDS_PER_QUERY: u32 = 50;
+
+/// Maximum number of escrow ids returned per page by `get_escrows_by_vendor`
+/// and `get_escrows_by_seller`, regardless of the caller-supplied `limit`.
+pub const MAX_ESCROWS_PER_PAGE: u64 = 50;
+
+/// Default maximum escrow amount, capped to preserve arithmetic safety for fee
+/// calculations and aggregate accounting operations.
+///
+/// Like [`MIN_ESCROW_AMOUNT`], this is only the **default**. The canonical
+/// bound is `GlobalConfig::max_amount` (seeded from this constant by
+/// `storage::default_global_config`), and the admin may lower or raise it with
+/// `set_amount_limits`; validation reads the stored config rather than this
+/// constant.
 pub const MAX_ESCROW_AMOUNT: i128 = i128::MAX / 10_000;
 
 #[contract]
 pub struct Escrow;
 
-/// Maximum number of appeals allowed per dispute.
+/// Default maximum number of appeals allowed per dispute. Admin can override
+/// via `queue_set_max_appeals` / `execute_set_max_appeals`.
 pub const MAX_APPEALS: u32 = 3;
+
+/// Upper bound on the appeal-fee escalation multiplier. Round `n` (1-based)
+/// charges `n * appeal_fee_bps`; `MAX_MAX_APPEALS + 1` is the largest multiplier
+/// reachable under the configurable appeal cap, and the escalated rate is
+/// additionally capped at `BASIS_POINTS` (100%).
+pub const MAX_APPEAL_FEE_MULTIPLIER: u32 = MAX_MAX_APPEALS + 1;
+
+/// Minimum value accepted by `set_max_appeals`.
+pub const MIN_MAX_APPEALS: u32 = 1;
+
+/// Maximum value accepted by `set_max_appeals`.
+pub const MAX_MAX_APPEALS: u32 = 10;
+
+/// Minimum value accepted by `set_max_basket_size`.
+pub const MIN_MAX_BASKET_SIZE: u32 = 1;
+
+/// Returns the admin-configured maximum number of appeals, falling back to
+/// `MAX_APPEALS` if the admin has not overridden it.
+pub(crate) fn read_max_appeals(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxAppeals)
+        .unwrap_or(MAX_APPEALS)
+}
+
+/// Returns the admin-configured maximum basket size, falling back to
+/// `MAX_BASKET_SIZE` if the admin has not overridden it.
+pub(crate) fn read_max_basket_size(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxBasketSize)
+        .unwrap_or(MAX_BASKET_SIZE)
+}
 
 /// Default maximum duration (in seconds) a dispute may remain unresolved
 /// before either party can force a refund with `claim_dispute_timeout`.
@@ -253,7 +316,7 @@ const MAX_DISPUTE_TIMEOUT: u64 = 31_536_000;
 /// How long (in seconds) a split multi-resolver vote must remain deadlocked
 /// before the permissionless majority-rules fallback
 /// `resolve_deadlocked_dispute` may be used. Default: 7 days.
-const DISPUTE_DEADLOCK_WINDOW: u64 = 604_800;
+pub const DISPUTE_DEADLOCK_WINDOW: u64 = 604_800;
 
 /// Number of persistent-storage buckets each lifecycle counter is spread
 /// across. Sharding keeps concurrent `create`/`complete`/`dispute`/`refund`
@@ -282,7 +345,9 @@ pub(crate) fn next_escrow_id(env: &Env) -> Result<u64, ContractError> {
         .set(&DataKey::EscrowCounter, &next_id);
 
     let ext = get_ttl_extension(env);
-    env.storage().instance().extend_ttl(ext / 2, ext);
+    env.storage()
+        .instance()
+        .extend_ttl(ext / TTL_THRESHOLD_DIVISOR, ext);
 
     Ok(escrow_id)
 }
@@ -295,8 +360,11 @@ fn resolve_or_vote_internal(
     caller: Address,
     escrow_id: u64,
     resolution: ResolutionType,
+    reason: Option<Symbol>,
+    memo: soroban_sdk::Bytes,
 ) -> Result<(), ContractError> {
     ensure_action_not_paused(env, Symbol::new(env, "RESOLVE"))?;
+    resolution.validate()?;
     let escrow = load_escrow(env, escrow_id)?;
 
     if escrow.state != EscrowState::Disputed {
@@ -334,6 +402,8 @@ fn resolve_or_vote_internal(
             final_resolution,
             votes,
             true,
+            reason,
+            memo,
         )?;
     } else {
         save_resolver_votes(env, escrow_id, &votes);
@@ -366,6 +436,7 @@ mod test_delivery;
 mod test_dispute;
 mod test_dispute_deadline_overflow;
 mod test_dispute_flow;
+mod test_dispute_reason;
 mod test_dispute_timeout;
 mod test_dispute_window;
 mod test_edge_cases;
@@ -380,6 +451,7 @@ mod test_fee_property_invariants;
 mod test_fee_snapshot;
 mod test_fee_update;
 mod test_finalize_dispute_appeal_boundary;
+mod test_gas_profile;
 mod test_get_escrows_by_buyer;
 mod test_get_escrows_by_ids;
 mod test_get_escrows_by_seller;
@@ -408,9 +480,12 @@ mod test_sep41;
 mod test_set_fee_boundary;
 mod test_set_fee_collector;
 mod test_shipping_window;
+mod test_state_flow_fixes;
 mod test_state_history;
 mod test_storage_collision;
+mod test_storage_differential;
 mod test_string_length;
+mod test_token_allowlist;
 mod test_ttl;
 mod test_unauthorized;
 mod test_upgrade_migration;

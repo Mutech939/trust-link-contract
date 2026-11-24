@@ -41,7 +41,7 @@
 use crate::admin::ADMIN_TIMELOCK_DELAY_SECONDS;
 use crate::test_helpers::{create_funded_escrow, setup_contract};
 use crate::{
-    ContractError, DataKey, EscrowData, EscrowState, DEFAULT_TTL_EXTENSION, MIN_TTL_EXTENSION,
+    ContractError, DataKey, EscrowData, DEFAULT_TTL_EXTENSION, MIN_TTL_EXTENSION,
     TTL_THRESHOLD_DIVISOR,
 };
 use soroban_sdk::{
@@ -112,8 +112,8 @@ fn test_dispute_stored_in_persistent_storage() {
     client.raise_dispute(
         &buyer,
         &id,
-        &soroban_sdk::Symbol::new(&env, "test"),
-        &soroban_sdk::String::from_str(&env, "desc"),
+        &soroban_sdk::Symbol::new(&env, "OTHER"),
+        &soroban_sdk::Bytes::from_slice(&env, b"desc"),
         &soroban_sdk::BytesN::from_array(&env, &[0xab; 32]),
     );
 
@@ -285,7 +285,7 @@ fn test_vendor_index_ttl_extended_on_write() {
     env.ledger().set(ledger_info);
 
     // Vendor index must still be queryable — TTL was extended on write.
-    let escrows = client.get_escrows_by_vendor(&seller);
+    let escrows = client.get_escrows_by_vendor(&seller, &0_u64, &50_u64);
     assert_eq!(
         escrows.len(),
         1,
@@ -311,7 +311,7 @@ fn test_vendor_index_ttl_extended_on_read() {
     );
 
     // First read at current ledger — this extends TTL on read.
-    let escrows_before = client.get_escrows_by_vendor(&seller);
+    let escrows_before = client.get_escrows_by_vendor(&seller, &0_u64, &50_u64);
     assert_eq!(escrows_before.len(), 1);
 
     // Advance by DEFAULT_TTL_EXTENSION - 1 (entry was refreshed by the read above
@@ -321,7 +321,7 @@ fn test_vendor_index_ttl_extended_on_read() {
     env.ledger().set(ledger_info);
 
     // Re-read: entry must still be accessible.
-    let escrows_after = client.get_escrows_by_vendor(&seller);
+    let escrows_after = client.get_escrows_by_vendor(&seller, &0_u64, &50_u64);
     assert_eq!(
         escrows_after.len(), 1,
         "vendor index was archived after ledger advance even though TTL should have been refreshed on read"
@@ -387,8 +387,8 @@ fn test_resolver_votes_ttl_extended() {
     client.raise_dispute(
         &buyer,
         &id,
-        &soroban_sdk::Symbol::new(&env, "defect"),
-        &soroban_sdk::String::from_str(&env, "item broken"),
+        &soroban_sdk::Symbol::new(&env, "DEFECTIVE"),
+        &soroban_sdk::Bytes::from_slice(&env, b"item broken"),
         &soroban_sdk::BytesN::from_array(&env, &[0xcd; 32]),
     );
 
@@ -523,7 +523,7 @@ fn execute_set_ttl_extension_below_minimum_is_rejected() {
             .set_timestamp(now + ADMIN_TIMELOCK_DELAY_SECONDS + 1);
 
         assert_eq!(
-            client.try_execute_set_ttl_extension(&admin),
+            client.try_execute_set_ttl_extension(&admin, &below),
             Err(Ok(ContractError::InvalidTtlExtension)),
             "execute_set_ttl_extension({}) must be rejected",
             below,
@@ -542,7 +542,7 @@ fn execute_set_ttl_extension_at_minimum_succeeds() {
     let now = env.ledger().timestamp();
     env.ledger()
         .set_timestamp(now + ADMIN_TIMELOCK_DELAY_SECONDS + 1);
-    client.execute_set_ttl_extension(&admin);
+    client.execute_set_ttl_extension(&admin, &MIN_TTL_EXTENSION);
 
     assert_eq!(
         effective_ttl_extension(&env, &contract_id).1,
@@ -581,7 +581,7 @@ fn queued_ttl_extension_applies_after_timelock() {
     env.ledger()
         .set_timestamp(now + ADMIN_TIMELOCK_DELAY_SECONDS + 1);
 
-    client.execute_set_ttl_extension(&admin);
+    client.execute_set_ttl_extension(&admin, &42_000_u32);
 
     assert_eq!(effective_ttl_extension(&env, &contract_id).1, 42_000);
 }
@@ -597,8 +597,8 @@ fn execute_ttl_extension_before_timelock_elapses_is_rejected() {
     client.queue_set_ttl_extension(&admin, &42_000_u32);
 
     assert_eq!(
-        client.try_execute_set_ttl_extension(&admin),
-        Err(Ok(ContractError::InvalidState)),
+        client.try_execute_set_ttl_extension(&admin, &42_000_u32),
+        Err(Ok(ContractError::TimelockNotElapsed)),
     );
     assert_eq!(
         effective_ttl_extension(&env, &contract_id).1,
@@ -614,7 +614,7 @@ fn execute_ttl_extension_without_a_queued_proposal_is_rejected() {
     let (_contract_id, client, admin, _fee_collector) = setup_contract(&env);
 
     assert_eq!(
-        client.try_execute_set_ttl_extension(&admin),
+        client.try_execute_set_ttl_extension(&admin, &42_000_u32),
         Err(Ok(ContractError::InvalidState)),
     );
 }
@@ -636,7 +636,7 @@ fn timelocked_smaller_ttl_value_flows_into_extend_ttl() {
     let now = env.ledger().timestamp();
     env.ledger()
         .set_timestamp(now + ADMIN_TIMELOCK_DELAY_SECONDS + 1);
-    client.execute_set_ttl_extension(&admin);
+    client.execute_set_ttl_extension(&admin, &new_ttl);
 
     let seller = Address::generate(&env);
     let buyer = Address::generate(&env);
@@ -686,8 +686,8 @@ fn disputed_escrow_with_message(env: &Env, client: &crate::EscrowClient) -> u64 
     client.raise_dispute(
         &buyer,
         &id,
-        &soroban_sdk::Symbol::new(env, "defect"),
-        &soroban_sdk::String::from_str(env, "item broken"),
+        &soroban_sdk::Symbol::new(env, "DEFECTIVE"),
+        &soroban_sdk::Bytes::from_slice(env, b"item broken"),
         &soroban_sdk::BytesN::from_array(env, &[0xee; 32]),
     );
     client.post_message(&id, &buyer, &soroban_sdk::String::from_str(env, "hello"));
@@ -722,7 +722,7 @@ fn extend_escrow_ttl_tops_up_every_entry_without_mutation() {
                 .persistent()
                 .get(&DataKey::Escrow(id))
                 .unwrap();
-            let history: Vec<(EscrowState, u64)> = env
+            let history: Vec<u64> = env
                 .storage()
                 .persistent()
                 .get(&DataKey::EscrowStateHistory(id))

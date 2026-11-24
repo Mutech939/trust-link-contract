@@ -89,7 +89,7 @@ sequenceDiagram
     participant B as Buyer
     participant R as Resolver
 
-    S->>C: create_escrow(token, amount, shipping_window)
+    S->>C: create_escrow(seller_or_payees, buyer, resolver, token, amount, fee_bps, resolver_fee_bps, shipping_window, notes)
     C-->>S: escrow_id
 
     B->>C: fund_escrow(escrow_id)
@@ -162,6 +162,9 @@ TrustLink charges fees along two independent axes:
 
 ## Multi-Resolver Dispute Resolution (M-of-N Voting)
 
+See [docs/resolvers.md](docs/resolvers.md) for single, M-of-N, and fallback
+schemes, including deadline gating and deadlock risks.
+
 An escrow's dispute resolver is not always a single address. `EscrowData.resolvers` holds a `ResolverSet`, which is one of three variants:
 
 | Variant | Created via | Resolver count | Vote threshold |
@@ -172,12 +175,12 @@ An escrow's dispute resolver is not always a single address. `EscrowData.resolve
 
 For all three variants, the same entry points are used to resolve a dispute:
 
-- `resolve_dispute(escrow_id, resolution)` or `vote(escrow_id, resolution)` — either name may be used; both call into the same voting logic. The caller must be a member of the escrow's `ResolverSet` (checked via `ResolverSet::contains`).
+- `resolve_dispute(escrow_id, resolution)` or `vote(escrow_id, resolution)` — either name may be used; both call into the same voting logic. The caller must be authorized by the escrow's `ResolverSet`; fallback authorization uses `can_resolve_now` so the backup is gated by its deadline.
 - Each call records or overwrites that resolver's vote (`ResolverVote { resolver, resolution, voted_at }`) — a resolver changing their mind simply votes again.
 - Votes are tallied separately per `ResolutionType` (`Release` vs `Refund`). Once either tally reaches `ResolverSet::threshold()`, the resolution executes automatically in the same transaction and the escrow moves to `PendingFinalization` (see [Appeal Flow](#appeal-flow)) — no separate "finalize the vote" step is needed to reach that state.
 - Full vote history for an escrow is queryable via `get_resolver_votes(escrow_id) -> Vec<ResolverVote>`.
 
-For `Single` and `Fallback` sets the threshold is 1, so the first vote from an authorized resolver resolves the dispute immediately. For `Fallback` sets specifically, **both** `primary` and `backup` are authorized to vote at any time — `dispute_deadline` is stored on `FallbackResolver` for off-chain/indexer reference but is not currently read by `contains`/`threshold`, so the contract does not itself gate backup takeover to after that deadline.
+For `Single` and `Fallback` sets the threshold is 1, so the first vote from an authorized resolver resolves the dispute. For `Fallback` sets specifically, the primary is always authorized, while the backup is authorized only when `ledger.timestamp() >= dispute_deadline`; the deadline is an absolute timestamp checked at call time.
 
 Multi-resolver escrows also support an **approved resolver registry**, managed by the admin:
 
@@ -220,7 +223,9 @@ Key rules (`finalize_dispute` / `appeal_dispute` in `lib.rs`):
 - `finalize_dispute` reverts with `AppealWindowActive` if called before `appeal_deadline`. It is permissionless (any caller may trigger it) once the window has elapsed, and pays out the previously-recorded resolution (minus platform and protocol fees) to the seller (`Release`) or buyer (`Refund`).
 - `appeal_dispute` reverts with `NotPendingFinalization` if the escrow isn't in `PendingFinalization`, and with `DisputeWindowStillOpen` if called after `appeal_deadline`. Only the escrow's buyer or (first) seller payee may call it.
 - A successful appeal clears the stored resolution and, for `Multi` resolver sets, deletes all recorded votes — resolvers must vote again from a clean slate. `DisputeData.appeal_count` is incremented so the number of appeal rounds is queryable via `get_dispute`.
-- There is no cap on the number of appeal rounds; the same window and rules apply to every round.
+- Appeals are limited by the admin-configured maximum (`MAX_APPEALS`, default 3;
+  configurable within the contract's allowed 1–10 range). Each permitted appeal
+  uses the same window and rules, and a new resolution starts a fresh round.
 
 ---
 
@@ -235,7 +240,9 @@ flowchart LR
     C -->|transfer each token| S
 ```
 
-- `create_basket_escrow(seller, buyer, resolver, tokens, amounts, fee_bps, shipping_window)` — `tokens` and `amounts` must be the same non-empty length. The primary `EscrowData` record (state, resolvers, fee config, lifecycle) tracks `tokens[0]`/`amounts[0]` as usual; the *full* token/amount list is stored separately as `Vec<TokenEntry>` keyed by escrow ID. Every token is checked against the token allowlist (if enabled) before the escrow is created.
+- `create_basket_escrow(seller, buyer, resolver, tokens, amounts, fee_bps, shipping_window, expires_at, grace_period)` — `tokens` and `amounts` must be the same non-empty length and at most 20 entries. Duplicate token addresses are rejected with a pairwise scan bounded to at most 190 comparisons. The primary `EscrowData` record (state, resolvers, fee config, lifecycle) tracks `tokens[0]`/`amounts[0]` as usual; the *full* token/amount list is stored separately as `Vec<TokenEntry>` keyed by escrow ID. Every token is checked against the token allowlist (if enabled) before the escrow is created. `expires_at` is optional; when set, its schedule and `grace_period` are persisted, basket funding is rejected once the deadline is reached, and the buyer can reclaim after the grace period.
+- The maximum-size creation gas regression test records CPU and memory use and enforces ceilings of 50,000,000 CPU instructions and 5,000,000 bytes of memory per call.
+- `create_basket_escrow(seller, buyer, resolver, tokens, amounts, fee_bps, shipping_window, notes, expires_at)` — `tokens` and `amounts` must be the same non-empty length. The primary `EscrowData` record (state, resolvers, fee config, lifecycle) tracks `tokens[0]`/`amounts[0]` as usual; the *full* token/amount list is stored separately as `Vec<TokenEntry>` keyed by escrow ID. Every token is checked against the token allowlist (if enabled) before the escrow is created. When `expires_at` is present, the contract also persists a `PendingExpiry` schedule used by funding and reclaim checks.
 - `fund_basket_escrow(escrow_id, buyer)` — transfers **all** basket tokens from the buyer to the contract in one call, in place of calling `fund_escrow` per token.
 - `get_basket_tokens(escrow_id) -> Vec<TokenEntry>` — read-only view of the full basket (each `TokenEntry { token, amount }`).
 - Payout: every path that releases funds for a basket escrow (`confirm_delivery`, `auto_release`, `co_signed_release`, dispute resolution via `finalize_dispute`) calls the primary token transfer *and* `payout_basket_tokens`, which iterates the stored `TokenEntry` list and transfers each additional token to the recipient. Non-basket escrows have an empty basket list, so `payout_basket_tokens` is a no-op for them — the same code path is safe for both.
@@ -343,6 +350,91 @@ Indexers expecting complete history for high-churn escrows should either:
 
 ---
 
+## Timelock Permission Model
+
+All admin-level mutations (fee changes, upgrades, resolver registry changes, pause/unpause, TTL extension, token allowlist, the timelock delay itself) are guarded by an **admin timelock delay** (`DataKey::AdminTimelockDelay`, default 24 hours, configurable between 12 hours and 30 days). This enforces a two-step workflow:
+
+1. **Queue**: Admin calls `queue_<operation>(params)` to propose the change.
+   - Requires admin auth.
+   - A proposal record is created with:
+     - `proposer`: the admin that queued the operation
+     - `ready_at`: current timestamp + the current timelock delay (see [Timelock delay changes](#timelock-delay-changes))
+     - `params_hash`: domain-separated hash from `compute_proposal_hash` (below)
+   - Emits `emit_timelock_queued` event
+
+2. **Execute**: Once `ready_at` has passed, **any address** can call `execute_<operation>(caller, params)` — the admin, a keeper bot, a cron job (#1235). The admin's authorization was captured at queue time, so execution needs no admin signature. `execute_timelock_op` checks, in order:
+   - `caller.require_auth()` — the *executor* signs for its own address, so the recorded executor is authentic
+   - a proposal is queued for the operation, else `InvalidState`
+   - `now >= proposal.ready_at`, else `TimelockNotElapsed`
+   - `proposal.proposer` is the **current** admin, else `NotAuthorized` (a proposal from a rotated-out admin never executes)
+   - `compute_proposal_hash(operation, params)` equals `proposal.params_hash`, else `InvalidProposalHash`
+   - Deletes the proposal record, applies the operation, and emits `TimelockExecuted { proposer, executor, params, .. }`. `executor == proposer` means the admin executed it; `executor != proposer` means a keeper did.
+
+3. **Cancel**: The **current admin** can cancel any pending proposal via `cancel_timelock_op(operation)`.
+   - Requires admin auth; non-admin callers rejected with `NotAuthorized`
+   - Allows admins to cancel accidental, superseded, or orphaned proposals
+   - Emits `emit_timelock_cancelled` event
+
+### Permission Summary
+
+| Operation | Queue | Execute | Cancel |
+|---|---|---|---|
+| `queue_*` (any mutation) | Current admin | **Anyone** who signs for their own address, after `ready_at`, while the proposer is still admin | Current admin |
+| `cancel_timelock_op` | — | Current admin only (`require_auth` + admin check) | — |
+
+### Proposal hash (domain separation)
+
+`compute_proposal_hash(env, operation, params)` hashes
+`params.to_xdr() || current_contract_address().to_xdr() || (operation as u32).to_xdr()`
+with SHA-256 (#1236). Binding the hash to the contract address and the operation code means:
+
+- the same parameter vector queued for two different operations (e.g. `SetPlatformFee(50)` and `SetArbitrationFee(50)`) produces two different hashes;
+- a proposal record copied into, or replayed against, another escrow instance does not verify there.
+
+Both queue and execute use the same helper, and a mismatch is `InvalidProposalHash`.
+
+### Timelock delay changes
+
+`queue_set_timelock_delay(new_delay)` rejects values outside `MIN_TIMELOCK_DELAY_SECONDS..=MAX_TIMELOCK_DELAY_SECONDS` with `InvalidTimelockDelay`. Otherwise the change itself is queued with a delay of **`max(current_delay, new_delay)`** (#1238):
+
+- **Shortening** (e.g. 24h → 12h) still waits the full *current* 24h, so a briefly compromised admin key cannot collapse the timelock and push a malicious upgrade through the shorter window.
+- **Lengthening** (e.g. 24h → 72h) waits the new 72h.
+- Proposals already queued keep the `ready_at` they were queued with, so a reduction never shortens an in-flight countdown.
+
+Executing early reverts with `TimelockNotElapsed`.
+
+### Admin Rotation Scenario
+
+If the admin role is rotated before a proposal executes:
+
+- **Old admin** queued a proposal; **new admin** takes over
+- The old proposal is **orphaned**: nobody (keeper, new admin, old admin) can execute it, because its proposer is no longer the current admin (`NotAuthorized`)
+- **New admin** can cancel it via `cancel_timelock_op` to free the operation slot
+- **New admin** must queue their own proposal and wait the full delay
+
+### Implementation
+
+All timelock operations go through `queue_timelock_op` / `execute_timelock_op` in `contracts/escrow/src/admin.rs`:
+
+```rust
+caller.require_auth(); // executor, may be a keeper
+// ...
+if now < proposal.ready_at {
+    return Err(ContractError::TimelockNotElapsed);
+}
+let admin = require_admin(env)?;
+if proposal.proposer != admin {
+    return Err(ContractError::NotAuthorized);
+}
+if compute_proposal_hash(env, operation, &params) != proposal.params_hash {
+    return Err(ContractError::InvalidProposalHash);
+}
+```
+
+Selected admin entry points can additionally be paused one at a time with `pause_action`; see [ADMIN.md](ADMIN.md#pausable-admin-actions).
+
+---
+
 ## Authorization Model
 
 | Operation | Who must sign |
@@ -351,7 +443,7 @@ Indexers expecting complete history for high-churn escrows should either:
 | `fund_escrow` / `fund_basket_escrow` | `buyer` |
 | `confirm_delivery` | `buyer` (retrieved from stored `EscrowData`) |
 | `raise_dispute` | `buyer` (retrieved from stored `EscrowData`) |
-| `resolve_dispute` / `vote` | caller must be a member of `EscrowData.resolvers` (any resolver for `Multi`, either address for `Fallback`, the single resolver for `Single`) |
+| `resolve_dispute` / `vote` | caller must be authorized by `EscrowData.resolvers` (any resolver for `Multi`, primary always or backup at/after its fallback deadline for `Fallback`, the single resolver for `Single`) |
 | `finalize_dispute` | No auth restriction beyond signing the transaction — permissionless once the appeal window has elapsed |
 | `appeal_dispute` | `buyer` or the first `payees` entry (seller), retrieved from stored `EscrowData` |
 | `add_approved_resolver` / `remove_approved_resolver` / `set_resolver_strict` | `admin` |

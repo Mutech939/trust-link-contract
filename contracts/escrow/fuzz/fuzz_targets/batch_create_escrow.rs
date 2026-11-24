@@ -43,9 +43,9 @@ fuzz_target!(|data: &[u8]| {
                 r.u64()
             },
             notes: if r.bool() {
-                Some(r.ascii_string(&h.env, 64))
+                r.ascii_string(&h.env, 64)
             } else {
-                Option::<SorobanString>::None
+                SorobanString::from_str(&h.env, "")
             },
         });
     }
